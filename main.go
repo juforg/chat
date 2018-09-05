@@ -13,44 +13,65 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	. "qychat_middleware/config"
 	"strconv"
 	"strings"
 	"time"
 
+	"fmt"
 	"github.com/kataras/go-errors"
 	"github.com/labstack/echo"
 	"github.com/labstack/echo/middleware"
 	"github.com/labstack/gommon/log"
 	"github.com/patrickmn/go-cache"
-	"github.com/yanjunhui/goini"
+	"io"
+	"mime/multipart"
 )
 
 var (
-	WorkPath       = GetWorkPath()
-	GetConfig      = goini.SetConfig(WorkPath + "config.conf")
-	corpId         = GetConfig.GetValue("weixin", "CorpID")
-	agentId        = GetConfig.GetValue("weixin", "AgentId")
-	secret         = GetConfig.GetValue("weixin", "Secret")
-	EncodingAESKey = GetConfig.GetValue("weixin", "EncodingAESKey")
+	//WorkPath       = GetWorkPath()
+
+	//GetConfig      = goini.SetConfig(WorkPath + "config.conf")
+	//corpId         = GetConfig.GetValue("weixin", "CorpID")
+	//agentId        = GetConfig.GetValue("weixin", "AgentId")
+	//secret         = GetConfig.GetValue("weixin", "Secret")
+	//EncodingAESKey = GetConfig.GetValue("weixin", "EncodingAESKey")
 
 	TokenCache *cache.Cache
+	config     Conf
 )
+
+const (
+	WechatUploadMediaAPI = "https://qyapi.weixin.qq.com/cgi-bin/media/upload"
+)
+
+type MediaUpload struct {
+	ErrCode   int    `json:"errcode"`
+	ErrMgs    string `json:"errmsg"`
+	Type      string `json:"type"`
+	MediaID   string `json:"media_id"`
+	CreatedAt string `json:"created_at"`
+}
 
 func init() {
 	TokenCache = cache.New(6000*time.Second, 5*time.Second)
 }
 
 func main() {
-
+	config := config.GetConf()
 	go GetAccessTokenFromWeixin()
 
 	e := echo.New()
 	e.Logger.SetLevel(log.INFO)
 	e.Use(middleware.Logger())
 	e.GET("/auth", WxAuth)
+	e.GET("/uploadpage", UploadPage)
+	e.GET("/getuserinfo", GetUserInfo)
 	e.POST("/send", SendMsg)
+	e.POST("/sendMedia", SendMedia)
 
-	port := GetConfig.GetValue("http", "port")
+	port := config.Http.Port
+	//port := GetConfig.GetValue("http", "port")
 	if port == "no value" {
 		e.Logger.Fatal(e.Start("0.0.0.0:4567"))
 	} else {
@@ -62,12 +83,53 @@ func main() {
 type Content struct {
 	Content string `json:"content"`
 }
+type MediaContent struct {
+	MediaId string `json:"media_id"`
+}
 
 type MsgPost struct {
 	ToUser  string  `json:"touser"`
 	MsgType string  `json:"msgtype"`
 	AgentID int     `json:"agentid"`
 	Text    Content `json:"text"`
+}
+type MediaPost struct {
+	MsgPost
+	ToParty string       `json:"toparty"`
+	ToTag   string       `json:"totag"`
+	Image   MediaContent `json:"image"`
+}
+type RetData struct {
+	RetCode string `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+}
+
+func UploadPage(context echo.Context) error {
+
+	return context.HTML(http.StatusOK, string(`<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Single file upload</title>
+</head>
+<body>
+<h1>Upload single file with fields</h1>
+
+<form action="/sendMedia" method="post" enctype="multipart/form-data">
+    Name: <input type="text" name="name"><br>
+    工号: <input id="tos" type="tos" name="tos"><br>
+    Files: <input type="file" name="mediafile"><br><br>
+    <input type="submit" value="上传附件">
+	<input type="button" value="获取个人信息" onclick="GetUserInfo()">
+</form>
+<script>
+function GetUserInfo(){
+tos = document.getElementById("tos").value;
+window.location= "/getuserinfo?workno="+tos;
+}
+</script
+</body>
+</html>`))
 }
 
 func SendMsg(context echo.Context) error {
@@ -93,7 +155,7 @@ func SendMsg(context echo.Context) error {
 	msg := MsgPost{
 		ToUser:  toUser,
 		MsgType: "text",
-		AgentID: StringToInt(agentId),
+		AgentID: StringToInt(config.Weixin.AgentId),
 		Text:    text,
 	}
 
@@ -108,13 +170,178 @@ func SendMsg(context echo.Context) error {
 	}
 
 	url := "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=" + accessToken.AccessToken
-
-	result, err := WxPost(url, msg)
+	jsonBody, err := encodeJson(msg)
+	if err != nil {
+		return context.String(200, "token解析失败!")
+	}
+	result, err := WxPost(url, jsonBody)
 	if err != nil {
 		log.Printf("请求微信失败: %v", err)
 	}
 	log.Printf("发送信息给%s, 信息内容: %s, 微信返回结果: %v", toUser, content, result)
 	return context.String(200, string(result))
+}
+
+func SendMedia(c echo.Context) error {
+	//filename := c.FormValue("filename")
+	retData := RetData{}
+	toUser := c.FormValue("tos")
+	file, err := c.FormFile("mediafile")
+	if err != nil {
+		return err
+	}
+	if file.Size > (2*1024*1024) || file.Size <= 0 {
+		retData.RetCode = "401"
+		retData.RetMsg = "图片不能大于2M!"
+		return c.JSON(200, retData)
+	}
+	src, err := file.Open()
+	if err != nil {
+		fmt.Println("error opening file")
+		retData.RetCode = "501"
+		retData.RetMsg = err.Error()
+		return c.JSON(200, retData)
+	}
+	defer src.Close()
+	bodyBuf := &bytes.Buffer{}
+	bodyWriter := multipart.NewWriter(bodyBuf)
+
+	//关键的一步操作
+	fileWriter, err := bodyWriter.CreateFormFile("media", file.Filename)
+	if err != nil {
+		fmt.Println("error writing to buffer")
+		retData.RetCode = "501"
+		retData.RetMsg = err.Error()
+		return c.JSON(200, retData)
+	}
+	_, err = io.Copy(fileWriter, src)
+	err = bodyWriter.Close()
+	if err != nil {
+		retData.RetCode = "501"
+		retData.RetMsg = err.Error()
+		return c.JSON(200, retData)
+	}
+	req, err := http.NewRequest("POST", WechatUploadMediaAPI, bodyBuf)
+	req.Header.Add("Content-Type", bodyWriter.FormDataContentType())
+	urlQuery := req.URL.Query()
+	if err != nil {
+		retData.RetCode = "501"
+		retData.RetMsg = err.Error()
+		return c.JSON(200, retData)
+	}
+	token, found := TokenCache.Get("token")
+	if !found {
+		log.Printf("token获取失败!")
+		retData.RetCode = "502"
+		retData.RetMsg = "token获取失败!"
+		return c.JSON(200, retData)
+	}
+	accessToken, ok := token.(AccessToken)
+	if !ok {
+		retData.RetCode = "502"
+		retData.RetMsg = "token获取失败!"
+		return c.JSON(200, retData)
+	}
+	urlQuery.Add("access_token", accessToken.AccessToken)
+	urlQuery.Add("type", "image")
+	req.URL.RawQuery = urlQuery.Encode()
+	client := http.Client{}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	jsonbody, _ := ioutil.ReadAll(res.Body)
+	media := MediaUpload{}
+	err = json.Unmarshal(jsonbody, &media)
+	if err != nil {
+		retData.RetCode = "501"
+		retData.RetMsg = err.Error()
+		return c.JSON(200, retData)
+	}
+	if media.MediaID == "" {
+		retData.RetCode = "503"
+		retData.RetMsg = string("发送失败" + media.ErrMgs)
+		return c.JSON(200, retData)
+	}
+	mediaid := media.MediaID
+	err = SendMediaById(mediaid, toUser, "", "", "image", "")
+	if err != nil {
+		retData.RetCode = "503"
+		retData.RetMsg = string("发送失败" + media.ErrMgs)
+		return c.JSON(200, retData)
+	}
+	retData.RetCode = "200"
+	retData.RetMsg = string("发送成功:" + mediaid)
+	return c.JSON(200, retData)
+}
+
+func SendMediaById(mediaId string, touser string, toparty string, totag string, msgtype string, safe string) (err error) {
+	image := MediaContent{}
+	image.MediaId = mediaId
+
+	msg := MediaPost{
+		Image: image,
+	}
+	msg.ToUser = touser
+	msg.AgentID = StringToInt(config.Weixin.AgentId)
+	msg.MsgType = msgtype
+
+	token, found := TokenCache.Get("token")
+	if !found {
+		log.Printf("token获取失败!")
+		return err
+	}
+	accessToken, ok := token.(AccessToken)
+	if !ok {
+		err = errors.New("token获取失败!")
+	}
+
+	url := "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=" + accessToken.AccessToken
+	jsonBody, err := encodeJson(msg)
+	if err != nil {
+		err = errors.New("token获取失败!")
+	}
+	result, err := WxPost(url, jsonBody)
+	if err != nil {
+		log.Printf("请求微信失败: %v", err)
+	}
+	log.Printf("发送信息给%s, 信息内容: %s, 微信返回结果: %v", touser, mediaId, result)
+
+	return
+}
+func GetUserInfo(c echo.Context) error {
+	retData := RetData{}
+	//workno := c.Param("workno")
+	workno := c.QueryParam("workno")
+	if workno == "" {
+		log.Printf("不存在工号!")
+		retData.RetCode = "502"
+		retData.RetMsg = "不存在!"
+		return c.JSON(200, retData)
+	}
+	token, found := TokenCache.Get("token")
+
+	if !found {
+		log.Printf("token获取失败!")
+		retData.RetCode = "502"
+		retData.RetMsg = "token获取失败!"
+		return c.JSON(200, retData)
+	}
+	accessToken, ok := token.(AccessToken)
+	if !ok {
+		retData.RetCode = "502"
+		retData.RetMsg = "token获取失败!"
+		return c.JSON(200, retData)
+	}
+
+	url := "https://qyapi.weixin.qq.com/cgi-bin/user/get?access_token=" + accessToken.AccessToken + "&userid=" + workno
+	result, err := WxGet(url)
+	if err != nil {
+		log.Printf("请求微信失败: %v", err)
+	}
+	log.Printf("获取信息%s, 微信返回结果: %v", workno, result)
+	return c.String(200, string(result))
 }
 
 //开启回调模式验证
@@ -129,7 +356,7 @@ func WxAuth(context echo.Context) error {
 	if err != nil {
 		return errors.New("接受微信请求参数 echostr base64解码失败(" + err.Error() + ")")
 	}
-	key, err := base64.StdEncoding.DecodeString(EncodingAESKey + "=")
+	key, err := base64.StdEncoding.DecodeString(config.Weixin.EncodingAESKey + "=")
 	if err != nil {
 		return errors.New("配置 EncodingAESKey base64解码失败(" + err.Error() + "), 请检查配置文件内 EncodingAESKey 是否和微信后台提供一致")
 	}
@@ -149,11 +376,11 @@ func WxAuth(context echo.Context) error {
 	if len(x) < int(appIDstart) {
 		return errors.New("获取数据错误, 请检查 EncodingAESKey 配置")
 	}
-	id := x[appIDstart : int(appIDstart)+len(corpId)]
-	if string(id) == corpId {
+	id := x[appIDstart : int(appIDstart)+len(config.Weixin.CorpID)]
+	if string(id) == config.Weixin.CorpID {
 		return context.JSONBlob(200, x[20:20+length])
 	}
-	return errors.New("微信验证appID错误, 微信请求值: " + string(id) + ", 配置文件内配置为: " + corpId)
+	return errors.New("微信验证appID错误, 微信请求值: " + string(id) + ", 配置文件内配置为: " + config.Weixin.CorpID)
 }
 
 type AccessToken struct {
@@ -167,12 +394,12 @@ type AccessToken struct {
 func GetAccessTokenFromWeixin() {
 
 	for {
-		if corpId == "" || secret == "" {
+		if config.Weixin.CorpID == "" || config.Weixin.Secret == "" {
 			log.Printf("corpId或者secret 获取失败, 请检查配置文件")
 			return
 		}
 
-		WxAccessTokenUrl := "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=" + corpId + "&corpsecret=" + secret
+		WxAccessTokenUrl := "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=" + config.Weixin.CorpID + "&corpsecret=" + config.Weixin.Secret
 
 		tr := &http.Transport{
 			TLSClientConfig:    &tls.Config{InsecureSkipVerify: true},
@@ -217,13 +444,22 @@ func GetAccessTokenFromWeixin() {
 }
 
 //微信请求数据
-func WxPost(url string, data MsgPost) (string, error) {
-	jsonBody, err := encodeJson(data)
+func WxPost(url string, jsonBody []byte) (string, error) {
+	r, err := http.Post(url, "application/json;charset=utf-8", bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", err
 	}
 
-	r, err := http.Post(url, "application/json;charset=utf-8", bytes.NewReader(jsonBody))
+	defer r.Body.Close()
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(body), err
+}
+func WxGet(url string) (string, error) {
+	r, err := http.Get(url)
 	if err != nil {
 		return "", err
 	}

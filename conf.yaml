@@ -1,0 +1,7 @@
+http:
+  port: 4567
+weixin:
+  corpid: wx52047e9830706257
+  agentid: 1000002
+  secret: yeQzcB9Vag-1BmRvzlLo9UbIsXwajIcsu-Jz6BNJrF8
+  encodingaeskey: yeQzcB9Vag-1BmRvzlLo9UbIsXwajIcsu-Jz6BNJrF8
